@@ -1,0 +1,17 @@
+{
+  "name": "candleodds-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted CandleOdds auto-trade worker",
+  "scripts": {
+    "start": "node start.mjs"
+  },
+  "dependencies": {
+    "@polymarket/client": "0.10.0",
+    "postgres": "3.4.9",
+    "viem": "2.56.0"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
