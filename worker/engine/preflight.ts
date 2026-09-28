@@ -43,7 +43,11 @@ export async function fetchGeoblock(fetchFn: typeof fetch = fetch): Promise<Geob
   return (await res.json()) as Geoblock;
 }
 
-export type PreflightResult = { problems: string[]; notes: string[] };
+/** problems stop the worker. locationBlocked does NOT: the worker keeps running with trading halted (like the kill
+ * switch), reports it so /auto/setup can show "Wrong region", and re-checks - the fix is a Railway setting. */
+export type PreflightResult = { problems: string[]; notes: string[]; locationBlocked?: string };
+
+export const WRONG_REGION_HINT = "Change the service's region to EU West (Amsterdam) in Railway (Settings -> Region) and redeploy.";
 
 export async function livePreflight(
   cfg: EngineConfig,
@@ -52,6 +56,7 @@ export async function livePreflight(
 ): Promise<PreflightResult> {
   const problems: string[] = [];
   const notes: string[] = [];
+  let locationBlocked: string | undefined;
 
   // 1. The key must control the wallet the operator expects - never trade from an unexpected one.
   if (trader.wallet.toLowerCase() !== cfg.expectedWallet) {
@@ -67,7 +72,7 @@ export async function livePreflight(
   try {
     const decision = evaluateGeoblock(await geoblock());
     if (decision.allowed) notes.push(decision.detail);
-    else problems.push(`${decision.detail}. Deploy the worker in Railway's EU West (Amsterdam) region.`);
+    else locationBlocked = decision.detail;
   } catch (e) {
     problems.push(`Could not check the geoblock: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -88,5 +93,5 @@ export async function livePreflight(
     problems.push(`Could not read the trading approvals: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  return { problems, notes };
+  return { problems, notes, locationBlocked };
 }

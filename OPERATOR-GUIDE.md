@@ -177,7 +177,7 @@ Set these in Railway → your worker service → Variables.
 |---|---|---|---|
 | `AUTOTRADE_MODE` | no | `shadow` | `shadow` records what it would do and places nothing. `live` places **real orders**. |
 | `AUTOTRADE_LIVE_CONFIRM` | live only | none | Must be exactly `yes-place-real-orders`. A safety catch so live mode is never an accident. |
-| `WALLET_PRIVATE_KEY` | live only | none | Your exported owner key (`0x` + 64 hex characters). **Secret.** From section 3. |
+| `WALLET_PRIVATE_KEY` | live only | none | Your exported owner key: 64 hex characters, with or without `0x` at the start. **Secret.** From section 3 (use **Copy key**, not the address). |
 | `AUTOTRADE_EXPECTED_WALLET` | live only | none | Your trading wallet address from the Wallet screen. The worker refuses to start if the key does not control this wallet. |
 | `CANDLEODDS_TOKEN` | yes | none | Your access token from CandleOdds (`cot_...`). **Secret.** |
 | `DATABASE_URL` | yes | none | Your Railway Postgres connection (use a reference to the Postgres service). The worker creates its own tables. |
@@ -194,6 +194,7 @@ Set these in Railway → your worker service → Variables.
 | `TAKER_SLIPPAGE_CENTS` | no | `1` | `taker` only: the price cap of each fill-and-kill order is `min(best ask + this, ENTRY_MAX_CENTS)`. It absorbs a one-cent move between reading the book and the order landing; it can never go above `ENTRY_MAX_CENTS`. |
 | `TAKER_MAX_ATTEMPTS` | no | `3` | `taker` only: how many fill-and-kill attempts per window. Only a clean no-fill is retried. |
 | `TAKER_RETRY_WINDOW_SECONDS` | no | `20` | `taker` only: retries stop this many seconds after the decision. |
+| `AUTOTRADE_REENTRY_UNTIL_SECONDS` | no | `480` | `taker` only: if the ask is above `ENTRY_MAX_CENTS` when a TAKE is decided, keep watching until this many seconds after the window opened and buy the first time the ask is back in range (section 5b). `0` turns it off. At most `840`. |
 | `MAKER_FILL_TIMEOUT_SECONDS` | no | `45` | `maker_first` only: how long a maker order rests before "fill now" converts the remainder. |
 | `ORDER_TTL_SECONDS` | no | `360` | How long an order may rest at most (it never outlives its 15-minute window). |
 | `AUTOTRADE_WAIT_SECONDS` | no | `10` | Wait after window open before deciding. |
@@ -263,6 +264,26 @@ order is never redone, so switching mid-window cannot double a trade. Try `taker
 
 ---
 
+### 5b. Re-entry (taker mode)
+
+When a TAKE is decided the ask is sometimes already above `ENTRY_MAX_CENTS`, because the price moved in the signal's
+direction in the first seconds. In the data so far those signals won more often than average. With re-entry (on by
+default in taker mode), the worker does not give up on such a window:
+
+- it records nothing yet and logs `RE-ENTRY WAIT: ask above the entry range - watching for it to come back`;
+- on every tick (every 3 seconds) it reads a fresh order book, until `AUTOTRADE_REENTRY_UNTIL_SECONDS` after the window
+  opened (480 = minute 8);
+- the first time the ask is back inside the range it buys exactly as it normally would (one fill-and-kill order,
+  capped at `ENTRY_MAX_CENTS`) and logs `RE-ENTRY: ask back inside the entry range`;
+- if the ask never comes back it records `skipped: reentry_expired` and logs `RE-ENTRY WINDOW OVER`.
+
+Everything else still applies while it watches: one trade per window, the daily trade and loss limits (re-checked on
+every look), the kill switch and a rejected token (both end the watch), and a revoked signal (the watch ends with
+`RE-ENTRY STOPPED`). An ask *below* the range at decision time is not watched. A restart during a watch does not
+resume it. Set `AUTOTRADE_REENTRY_UNTIL_SECONDS=0` to turn re-entry off.
+
+---
+
 ## 6. Verify with a small stake before trusting it
 
 Do this in order. Nothing here risks more than one stake.
@@ -320,10 +341,11 @@ If the worker's location ever becomes blocked by Polymarket it halts by itself (
 | You see | What it means / what to do |
 |---|---|
 | `STOP: Configuration problems: ...` | A variable is missing or invalid. The list says which. |
+| `That's a wallet address, not your private key. Use Copy key in the export window.` | You pasted an address into `WALLET_PRIVATE_KEY`. In the export window use **Copy key**; the address shown there is your key's address, not the key. |
 | `CandleOdds rejected CANDLEODDS_TOKEN` | The token is wrong, was replaced or revoked, or your membership no longer includes Auto. Make a new token on /auto/setup (step 2) and put it into `CANDLEODDS_TOKEN`. If /auto/setup says Auto isn't part of your membership, renew it first. |
 | `The key controls wallet 0x..., not the AUTOTRADE_EXPECTED_WALLET` | You exported the key from a different account than the wallet address you set. Re-check both on the Wallet screen. |
 | `preflight ok: location NL-NH: allowed by the API-level rule ...` | Normal from Amsterdam. Polymarket's website flags the Netherlands as close-only, but its API accepts orders, and the worker follows the API rule. Re-checked hourly (`hourly location check`). |
-| `location ...: not allowed for API trading` | The service is in a region where Polymarket refuses new orders. The template deploys to EU West (Amsterdam); for a manual deploy see section 4b.2 (Region). |
+| `LOCATION NOT ALLOWED - trading halted` | The service runs in a region where Polymarket refuses orders. The bot keeps running but places nothing, /auto/setup shows **Wrong region**, and it re-checks every 5 minutes. Fix: Railway → worker → **Settings → Region → EU West (Amsterdam)**, then redeploy. |
 | `Balance is $X, less than one stake` | Deposit USDC (Wallet screen) and redeploy. |
 | `missing N trading approval(s)` or `Could not set up the trading client` | The wallet has not been set up. Log in to candleodds.com with the same account once, then redeploy. |
 | `skipped: insufficient_balance` | Balance dropped below one stake. Deposit more. |

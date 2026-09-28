@@ -5,7 +5,7 @@ import { killSwitchOn } from "../decision.ts";
 import { loadEngineConfig } from "./config.ts";
 import { Engine } from "./engine.ts";
 import { HttpMarketData } from "./market.ts";
-import { evaluateGeoblock, fetchGeoblock, livePreflight } from "./preflight.ts";
+import { evaluateGeoblock, fetchGeoblock, livePreflight, WRONG_REGION_HINT } from "./preflight.ts";
 import { HttpReporter } from "./report.ts";
 import { AuthRejected, HttpSignals } from "./source.ts";
 import { PgStore } from "./store.ts";
@@ -13,6 +13,7 @@ import { createSdkTrader } from "./trader.ts";
 import type { Trader } from "./types.ts";
 
 const GEOBLOCK_RECHECK_MS = 60 * 60 * 1000;
+const GEOBLOCK_BLOCKED_RECHECK_MS = 5 * 60 * 1000;
 const ALIVE_LOG_MS = 5 * 60 * 1000; // a "still running" line every 5 minutes
 
 function log(msg: string, extra?: Record<string, unknown>) {
@@ -49,10 +50,13 @@ export async function run(mode: "shadow" | "live"): Promise<void> {
   // One plain-English line saying exactly how orders will be sent (also the first thing to check in the logs).
   log(
     cfg.execution === "taker"
-      ? `execution mode: TAKER - fill-and-kill at the real best ask from a fresh order book, capped at min(ask + ${cfg.takerSlippageCents}c, ${cfg.range.maxCents}c); up to ${cfg.takerMaxAttempts} attempts within ${cfg.takerRetryWindowSeconds}s of the decision (a no-fill is retried, a fill never is); nothing ever rests, every fill pays the taker fee`
+      ? `execution mode: TAKER - fill-and-kill at the real best ask from a fresh order book, capped at min(ask + ${cfg.takerSlippageCents}c, ${cfg.range.maxCents}c); up to ${cfg.takerMaxAttempts} attempts within ${cfg.takerRetryWindowSeconds}s of the decision (a no-fill is retried, a fill never is); nothing ever rests, every fill pays the taker fee; ` +
+          (cfg.reentryUntilSeconds > 0
+            ? `re-entry ON: an ask above ${cfg.range.maxCents}c at decision time is watched until ${cfg.reentryUntilSeconds}s after open and bought once it is back in range`
+            : "re-entry OFF")
       : `execution mode: MAKER_FIRST - a resting maker order, converted to a taker order after ${cfg.makerFillTimeoutSeconds}s if unfilled and still in range`,
     cfg.execution === "taker"
-      ? { execution: cfg.execution, takerSlippageCents: cfg.takerSlippageCents, takerMaxAttempts: cfg.takerMaxAttempts, takerRetryWindowSeconds: cfg.takerRetryWindowSeconds }
+      ? { execution: cfg.execution, takerSlippageCents: cfg.takerSlippageCents, takerMaxAttempts: cfg.takerMaxAttempts, takerRetryWindowSeconds: cfg.takerRetryWindowSeconds, reentryUntilSeconds: cfg.reentryUntilSeconds }
       : { execution: cfg.execution },
   );
 
@@ -74,6 +78,7 @@ export async function run(mode: "shadow" | "live"): Promise<void> {
 
   let trader: Trader | undefined;
   let geoBlocked = false;
+  let locationBlocked: string | undefined;
   if (mode === "live") {
     try {
       trader = await createSdkTrader(cfg);
@@ -86,6 +91,7 @@ export async function run(mode: "shadow" | "live"): Promise<void> {
     const pre = await livePreflight(cfg, trader!, fetchGeoblock);
     for (const n of pre.notes) log(`preflight ok: ${n}`);
     if (pre.problems.length) die("Pre-flight failed:\n - " + pre.problems.join("\n - "));
+    locationBlocked = pre.locationBlocked;
   }
 
   const reporter = new HttpReporter(cfg.candleoddsUrl, cfg.token, { mode, wallet: trader?.wallet ?? null, engine: "v1", execution: cfg.execution });
@@ -96,7 +102,15 @@ export async function run(mode: "shadow" | "live"): Promise<void> {
     maxTradesPerDay: cfg.rules.maxTradesPerDay,
     dailyLossLimitUsd: cfg.rules.dailyLossLimitUsd,
     range: cfg.range,
+    reentryUntilSeconds: cfg.execution === "taker" ? cfg.reentryUntilSeconds : null,
   });
+  // A blocked location does not stop the worker: it keeps running with trading halted (like the kill switch), tells
+  // CandleOdds (the member's /auto/setup shows "Wrong region"), and re-checks every 5 minutes (see below).
+  if (locationBlocked) {
+    geoBlocked = true;
+    log(`LOCATION NOT ALLOWED - trading halted. ${locationBlocked}. ${WRONG_REGION_HINT}`);
+    reporter.report("event", null, null, { event: "location_blocked", detail: locationBlocked });
+  }
 
   const engine = new Engine({
     cfg,
@@ -128,13 +142,17 @@ export async function run(mode: "shadow" | "live"): Promise<void> {
       lastAlive = Date.now();
       log("alive", { mode, ticks });
     }
-    if (mode === "live" && Date.now() - lastGeo > GEOBLOCK_RECHECK_MS) {
+    // Hourly, or every 5 minutes while blocked (so fixing the region is picked up quickly).
+    if (mode === "live" && Date.now() - lastGeo > (geoBlocked ? GEOBLOCK_BLOCKED_RECHECK_MS : GEOBLOCK_RECHECK_MS)) {
       lastGeo = Date.now();
       try {
         // Same API-level decision as the pre-flight, and what it decided is always logged.
         const decision = evaluateGeoblock(await fetchGeoblock());
-        log("hourly location check", { allowed: decision.allowed, detail: decision.detail });
-        if (decision.allowed === geoBlocked) log(decision.allowed ? "location allowed again - resuming" : "LOCATION NOT ALLOWED - halting trading");
+        log("location check", { allowed: decision.allowed, detail: decision.detail });
+        if (decision.allowed === geoBlocked) {
+          log(decision.allowed ? "location allowed again - resuming" : `LOCATION NOT ALLOWED - halting trading. ${WRONG_REGION_HINT}`);
+          reporter.report("event", null, null, decision.allowed ? { event: "location_ok", detail: decision.detail } : { event: "location_blocked", detail: decision.detail });
+        }
         geoBlocked = !decision.allowed;
       } catch {
         /* keep the last known state */

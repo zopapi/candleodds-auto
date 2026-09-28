@@ -67,6 +67,7 @@ export const SKIP_REASONS = [
   "below_min_order_size",
   "price_out_of_band_at_sizing",
   "sizing_failed",
+  "reentry_expired", // taker engine: the ask ran above the range and never came back before AUTOTRADE_REENTRY_UNTIL_SECONDS
 ] as const;
 
 /** UTC calendar day a window belongs to, as [startSec, endSec) - the unit "per day" limits

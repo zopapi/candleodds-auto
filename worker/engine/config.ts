@@ -28,6 +28,9 @@ export type EngineConfig = {
   takerMaxAttempts: number;
   /** Taker only: retries stop this many seconds after the decision. Default 20. */
   takerRetryWindowSeconds: number;
+  /** Taker only: if the ask is above ENTRY_MAX_CENTS at decision time, keep watching until this many seconds after the
+   * window opened and buy the first time the ask is back inside the entry range. 0 = off. Default 480 (minute 8). */
+  reentryUntilSeconds: number;
   makerFillTimeoutSeconds: number;
   orderTtlSeconds: number;
   pollMs: number;
@@ -35,6 +38,22 @@ export type EngineConfig = {
 
 const HEX_KEY = /^0x[0-9a-fA-F]{64}$/;
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
+
+export const ADDRESS_NOT_KEY_MESSAGE = "That's a wallet address, not your private key. Use Copy key in the export window.";
+
+/**
+ * WALLET_PRIVATE_KEY as pasted: 64 hex characters, with or without the 0x prefix (surrounding quotes and spaces are
+ * tolerated). A wallet ADDRESS (40 hex characters) is the most common mix-up - the export window shows the key's own
+ * address next to it - so it gets its own plain message. The value is never put into a message.
+ */
+export function normalizePrivateKey(raw: string | undefined): { ok: true; key: string } | { ok: false; problem: string } {
+  const v = (raw ?? "").trim().replace(/^["']|["']$/g, "").trim();
+  if (!v) return { ok: false, problem: "WALLET_PRIVATE_KEY is required in live mode." };
+  const withPrefix = /^0x/i.test(v) ? "0x" + v.slice(2) : "0x" + v;
+  if (HEX_KEY.test(withPrefix)) return { ok: true, key: withPrefix };
+  if (ADDRESS.test(withPrefix)) return { ok: false, problem: ADDRESS_NOT_KEY_MESSAGE };
+  return { ok: false, problem: "WALLET_PRIVATE_KEY must be the exported key: 64 hex characters (with or without 0x at the start)." };
+}
 
 export function loadEngineConfig(env: Record<string, string | undefined>, mode: "shadow" | "live"): EngineConfig {
   const problems: string[] = [];
@@ -100,13 +119,15 @@ export function loadEngineConfig(env: Record<string, string | undefined>, mode: 
   const takerSlippageCents = num("TAKER_SLIPPAGE_CENTS", 1, { min: 0, max: 10 });
   const takerMaxAttempts = num("TAKER_MAX_ATTEMPTS", 3, { int: true, min: 1, max: 5 });
   const takerRetryWindowSeconds = num("TAKER_RETRY_WINDOW_SECONDS", 20, { min: 1, max: 120 });
+  // At most 840 (minute 14): a re-entry must leave time for the order before the 15-minute window ends.
+  const reentryUntilSeconds = num("AUTOTRADE_REENTRY_UNTIL_SECONDS", 480, { int: true, min: 0, max: 840 });
 
   let privateKey: string | undefined;
   let expectedWallet: string | undefined;
   if (mode === "live") {
-    privateKey = env.WALLET_PRIVATE_KEY?.trim();
-    if (!privateKey) problems.push("WALLET_PRIVATE_KEY is required in live mode.");
-    else if (!HEX_KEY.test(privateKey)) problems.push("WALLET_PRIVATE_KEY must be the exported key: 0x followed by 64 hex characters."); // never echo the value
+    const key = normalizePrivateKey(env.WALLET_PRIVATE_KEY);
+    if (key.ok) privateKey = key.key;
+    else problems.push(key.problem); // never echoes the value
     expectedWallet = env.AUTOTRADE_EXPECTED_WALLET?.trim();
     if (!expectedWallet) problems.push("AUTOTRADE_EXPECTED_WALLET is required in live mode (your trading wallet address from the Wallet screen).");
     else if (!ADDRESS.test(expectedWallet)) problems.push("AUTOTRADE_EXPECTED_WALLET must be a 0x wallet address.");
@@ -132,6 +153,7 @@ export function loadEngineConfig(env: Record<string, string | undefined>, mode: 
     takerSlippageCents,
     takerMaxAttempts,
     takerRetryWindowSeconds,
+    reentryUntilSeconds,
     makerFillTimeoutSeconds: num("MAKER_FILL_TIMEOUT_SECONDS", 45, { int: true, min: 1 }),
     orderTtlSeconds: num("ORDER_TTL_SECONDS", 360, { int: true, min: 1 }),
     pollMs: num("AUTOTRADE_POLL_MS", 3000, { int: true, min: 500 }),

@@ -14,6 +14,10 @@
 //     send), capped at min(best ask + TAKER_SLIPPAGE_CENTS, ENTRY_MAX_CENTS). A fill-and-kill that fills
 //     NOTHING cannot double-fill, so it is retried (max TAKER_MAX_ATTEMPTS, only within the first
 //     TAKER_RETRY_WINDOW_SECONDS of the decision); after ANY fill, or any doubt, it never retries;
+//   - taker re-entry: if the ask is ABOVE the range at decision time (the price ran in the signal's favour), nothing is
+//     recorded yet - the window is watched on every tick until AUTOTRADE_REENTRY_UNTIL_SECONDS after open and bought
+//     the first time the ask is back inside the range (same claim-then-place, so still one trade per window). Limits
+//     are re-read on every look; a revoked signal, the kill switch or a rejected token ends the watch;
 //   - daily trade and loss limits, a kill switch, and an immediate stop if the token is revoked.
 import {
   computeOrderExpiration,
@@ -61,6 +65,10 @@ export class Engine {
   private resolved = new Set<string>();
   private lastFillNowAttempt = new Map<string, number>();
   private balance: { at: number; usd: number } | undefined;
+  /** Taker re-entry: windows whose ask was ABOVE the entry range at decision time, being watched (nothing recorded
+   * yet) until cfg.reentryUntilSeconds after open. In memory only: after a restart such a window is past the normal
+   * cutoff and is recorded as too_late, so a restart can never trade it twice. */
+  private reentry = new Map<string, { sinceSec: number }>();
 
   constructor(deps: EngineDeps) {
     this.d = deps;
@@ -85,6 +93,7 @@ export class Engine {
     if (this.d.killSwitch()) {
       if (!this.killHandled) {
         this.killHandled = true;
+        this.dropReentries("kill_switch");
         log("KILL SWITCH ON - no new trades; cancelling resting orders");
         await this.cancelAllResting("kill_switch");
         this.d.reporter.report("event", null, null, { event: "kill_switch_on" });
@@ -104,6 +113,7 @@ export class Engine {
       if (e instanceof AuthRejected) {
         if (!this.haltedRemote) {
           this.haltedRemote = true;
+          this.dropReentries("token_rejected");
           log("CLIENT TOKEN REJECTED - stopping: cancelling resting orders and making no decisions until it works again", { status: e.status });
           await this.cancelAllResting("token_rejected");
           this.d.reporter.report("event", null, null, { event: "token_rejected" });
@@ -126,6 +136,8 @@ export class Engine {
       return;
     }
     const nowSec = localSec + this.clockOffsetSec;
+    // A watched window whose 15 minutes are over (e.g. its card was never seen again) is forgotten.
+    for (const k of this.reentry.keys()) if (nowSec - Number(k.split(":")[1]) > 900) this.reentry.delete(k);
 
     // A claim that never became an order (crash mid-placement) is failed, not retried.
     if (this.live) {
@@ -157,13 +169,34 @@ export class Engine {
     // Taker mode gates on the REAL best ask from the live book (checked at sizing below), not on the card's
     // live price, which is a ticks MIDPOINT a few seconds old. Maker mode keeps the card-price gate.
     const gateOnCardPrice = cfg.execution !== "taker";
-    const first = precheck(card, nowSec, cfg.rules, zero, cfg.range, gateOnCardPrice);
-    if (first.kind === "ignore" || first.kind === "defer") return;
-    if (await store.getWindow(card.symbol, card.windowStartTs)) return; // already decided
+    const key = `${card.symbol}:${card.windowStartTs}`;
+    const waiting = this.reentry.get(key);
+    // A window being watched for re-entry may be decided up to reentryUntilSeconds after open (not the normal cutoff).
+    const rules = waiting ? { ...cfg.rules, maxAgeSeconds: Math.max(cfg.rules.maxAgeSeconds, cfg.reentryUntilSeconds) } : cfg.rules;
+    const first = precheck(card, nowSec, rules, zero, cfg.range, gateOnCardPrice);
+    if (first.kind === "ignore") {
+      // The TAKE is gone from the card (revoked): stop watching; nothing was ever recorded or placed.
+      if (waiting) this.endReentry(card, "signal_revoked", nowSec);
+      return;
+    }
+    if (first.kind === "defer") return;
+    if (await store.getWindow(card.symbol, card.windowStartTs)) {
+      this.reentry.delete(key);
+      return; // already decided
+    }
+    if (waiting && first.kind === "record" && first.decision === "skipped" && first.reason === "too_late") {
+      this.endReentry(card, "reentry_expired", nowSec);
+      await this.recordFinal({
+        symbol: card.symbol, windowStartTs: card.windowStartTs, mode: cfg.mode, lean: card.lean, entry: card.entry, currentPrice: card.currentPrice,
+        stakeUsd: cfg.stakeUsd, tokenId: null, decidedAtMs: this.d.nowMs(), execution: cfg.execution, decision: "skipped", reason: "reentry_expired",
+      });
+      return;
+    }
 
     let pre: Decision = first;
     if (first.kind === "need_book") {
-      pre = precheck(card, nowSec, cfg.rules, await store.dayStats(card.windowStartTs), cfg.range, gateOnCardPrice);
+      // Limits are re-read on every look, so a watched window respects a trade cap or loss limit reached meanwhile.
+      pre = precheck(card, nowSec, rules, await store.dayStats(card.windowStartTs), cfg.range, gateOnCardPrice);
     }
 
     let final: Decision = pre;
@@ -176,8 +209,24 @@ export class Engine {
         meta = { tickSize: m.tickSize, minOrderSize: m.minOrderSize };
         const book = { tickSize: m.tickSize, minOrderSize: m.minOrderSize, asks: await market.asks(m.tokenId) };
         if (cfg.execution === "taker") {
+          const plan = planTakerAttempt({ asks: book.asks, tickSize: book.tickSize, minOrderSize: book.minOrderSize, stakeUsd: cfg.stakeUsd, slippageCents: cfg.takerSlippageCents, range: cfg.range });
+          const outOfRange = !plan.ok && plan.reason === "ask_out_of_range";
+          const above = outOfRange && plan.bestAsk !== undefined && plan.bestAsk * 100 > cfg.range.maxCents + 1e-9;
+          const ageSec = nowSec - card.windowStartTs;
+          // Re-entry: an ask ABOVE the range starts a watch; once watching, any out-of-range ask keeps it going.
+          if ((waiting ? outOfRange : above) && ageSec < cfg.reentryUntilSeconds) {
+            if (!waiting) this.startReentry(card, nowSec, plan.ok ? undefined : plan.bestAsk, book);
+            return; // nothing recorded: look again on the next tick
+          }
           final = sizeTakerDecision(card, book, cfg.rules, cfg.range, cfg.takerSlippageCents);
           this.logDecisionBook(card, book);
+          if (waiting) {
+            this.reentry.delete(key);
+            if (final.kind === "record" && final.decision === "would_place") {
+              this.d.log("RE-ENTRY: ask back inside the entry range", { symbol: card.symbol, window: card.windowStartTs, afterSec: ageSec, watchedSec: nowSec - waiting.sinceSec, bestAsk: final.bestAsk, cap: final.limitPrice, maxCents: cfg.range.maxCents });
+              this.d.reporter.report("event", card.symbol, card.windowStartTs, { event: "reentry_entry", afterSec: ageSec, bestAsk: final.bestAsk ?? null, cap: final.limitPrice });
+            }
+          }
         } else {
           final = sizeDecision(card, book, cfg.rules, cfg.range);
         }
@@ -222,6 +271,29 @@ export class Engine {
     const plan = planTakerAttempt({ asks: book.asks, tickSize: book.tickSize, minOrderSize: book.minOrderSize, stakeUsd: cfg.stakeUsd, slippageCents: cfg.takerSlippageCents, range: cfg.range });
     const snap = plan.ok ? { bestAsk: plan.book.bestAsk, askSize: plan.book.askSize, sizeWithinCap: plan.book.sizeWithinCap, cap: plan.book.cap } : { bestAsk: plan.bestAsk, askSize: plan.askSize, cap: plan.cap, skipReason: plan.reason };
     this.d.log("TAKER BOOK (decision)", { symbol: card.symbol, window: card.windowStartTs, execution: "taker", cardMidpoint: card.currentPrice, slippageCents: cfg.takerSlippageCents, maxCents: cfg.range.maxCents, ...snap });
+  }
+
+  private startReentry(card: Card, nowSec: number, bestAsk: number | undefined, book: { tickSize: number; minOrderSize: number; asks: BookLevel[] }): void {
+    const { cfg } = this.d;
+    this.reentry.set(`${card.symbol}:${card.windowStartTs}`, { sinceSec: nowSec });
+    this.logDecisionBook(card, book);
+    this.d.log("RE-ENTRY WAIT: ask above the entry range - watching for it to come back", { symbol: card.symbol, window: card.windowStartTs, ageSec: nowSec - card.windowStartTs, bestAsk, maxCents: cfg.range.maxCents, untilSec: cfg.reentryUntilSeconds });
+    this.d.reporter.report("event", card.symbol, card.windowStartTs, { event: "reentry_wait", ageSec: nowSec - card.windowStartTs, bestAsk: bestAsk ?? null, maxCents: cfg.range.maxCents, untilSec: cfg.reentryUntilSeconds });
+  }
+
+  private endReentry(card: Card, reason: "signal_revoked" | "reentry_expired", nowSec: number): void {
+    const key = `${card.symbol}:${card.windowStartTs}`;
+    const w = this.reentry.get(key);
+    this.reentry.delete(key);
+    this.d.log(reason === "reentry_expired" ? "RE-ENTRY WINDOW OVER: the ask never came back inside the range" : "RE-ENTRY STOPPED: the signal was revoked", { symbol: card.symbol, window: card.windowStartTs, ageSec: nowSec - card.windowStartTs, watchedSec: w ? nowSec - w.sinceSec : undefined });
+    if (reason === "signal_revoked") this.d.reporter.report("event", card.symbol, card.windowStartTs, { event: "reentry_revoked" });
+  }
+
+  /** Drops every re-entry watch (kill switch, revoked token): nothing was ever placed for them. */
+  private dropReentries(why: string): void {
+    if (this.reentry.size === 0) return;
+    this.d.log("re-entry watches dropped", { why, windows: [...this.reentry.keys()] });
+    this.reentry.clear();
   }
 
   private async recordFinal(w: WindowRow): Promise<void> {
