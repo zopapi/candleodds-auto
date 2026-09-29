@@ -18,8 +18,12 @@
 //     recorded yet - the window is watched on every tick until AUTOTRADE_REENTRY_UNTIL_SECONDS after open and bought
 //     the first time the ask is back inside the range (same claim-then-place, so still one trade per window). Limits
 //     are re-read on every look; a revoked signal, the kill switch or a rejected token ends the watch;
+//   - taker watch (v1.0.2): a window that ends its first burst short of the stake (nothing matched, the ask left the
+//     range, or a partial fill) is watched until AUTOTRADE_REENTRY_UNTIL_SECONDS and the rest bought when the ask is
+//     back in range - never more than the stake, never after a purchase it did not make itself, never after a restart;
 //   - daily trade and loss limits, a kill switch, and an immediate stop if the token is revoked.
 import {
+  bestAskOf,
   computeOrderExpiration,
   computeTakerPrice,
   isPriceAllowed,
@@ -28,10 +32,34 @@ import {
 } from "../../src/lib/trading.ts";
 import { resolveOrderStatus, sumFilledSince } from "../../src/lib/order-status.ts";
 import { precheck, simulatedPnlUsd, sizeDecision, type Decision } from "../decision.ts";
-import { boughtSince, feeFor, planTakerAttempt, sizeTakerDecision, takerFeeUsd } from "./taker.ts";
+import { feeFor, planTakerAttempt, sizeAtOrBelow, sizeTakerDecision, takerFeeUsd, topOfBook, unknownPurchaseShares } from "./taker.ts";
 import type { EngineConfig } from "./config.ts";
 import { AuthRejected, type SignalsSource } from "./source.ts";
-import type { BookLevel, Card, LegRow, MarketData, Reporter, Store, Trader, WindowRow } from "./types.ts";
+import type { BookLevel, Card, LegRow, MarketBuyResult, MarketData, Reporter, Store, Trader, WindowRow } from "./types.ts";
+
+type Meta = { tickSize: number; minOrderSize: number };
+/** A taker window being bought: what the window has bought so far, and its sends. */
+type TakerProgress = {
+  tokenId: string;
+  meta: Meta;
+  /** When the window was decided; the public feed is checked for purchases since then. */
+  decidedAtMs: number;
+  spentUsd: number;
+  feeUsd: number;
+  shares: number;
+  /** Fill-and-kill orders sent for this window so far (burst and watch). */
+  sends: number;
+  lastSendMs: number;
+  /** The cap of the last fill (the price the "is anything left worth buying" check uses). */
+  lastCap: number;
+};
+type AttemptResult =
+  | { kind: "filled"; snap: Record<string, unknown> }
+  | { kind: "no_match"; snap: Record<string, unknown>; detail: string; why: string }
+  | { kind: "error"; snap: Record<string, unknown> }
+  | { kind: "book_unavailable"; detail: string; snap?: undefined }
+  | { kind: "no_liquidity" | "ask_out_of_range" | "below_min_order_size"; snap: Record<string, unknown> };
+const r6 = (n: number) => Math.round(n * 1e6) / 1e6;
 
 export type EngineDeps = {
   cfg: EngineConfig;
@@ -54,6 +82,9 @@ const BALANCE_CACHE_MS = 15_000;
 // What the exchange says when a fill-and-kill order finds nothing to match (a rejection, not a fault).
 // Short pause between fill-and-kill attempts, so the next fresh book read sees a settled market.
 const TAKER_RETRY_DELAY_MS = 700;
+// A watched taker window: at most one send per this gap, and this many sends per window in all (burst included).
+const TAKER_WATCH_GAP_MS = 5_000;
+const TAKER_MAX_SENDS_PER_WINDOW = 12;
 const NO_MATCH = /no orders found to match|could(?: not|n.t) be (?:fully )?filled|not (?:fully )?filled|no match/i;
 
 export class Engine {
@@ -69,6 +100,10 @@ export class Engine {
    * yet) until cfg.reentryUntilSeconds after open. In memory only: after a restart such a window is past the normal
    * cutoff and is recorded as too_late, so a restart can never trade it twice. */
   private reentry = new Map<string, { sinceSec: number }>();
+  /** Taker windows short of their stake after the first burst (nothing matched, the ask left the range, or a partial
+   * fill), watched until cfg.reentryUntilSeconds after open. In memory only: a restart forgets them, and a window is
+   * never sent again after a restart. */
+  private building = new Map<string, TakerProgress>();
 
   constructor(deps: EngineDeps) {
     this.d = deps;
@@ -94,6 +129,7 @@ export class Engine {
       if (!this.killHandled) {
         this.killHandled = true;
         this.dropReentries("kill_switch");
+        this.dropTakerWatches("kill_switch");
         log("KILL SWITCH ON - no new trades; cancelling resting orders");
         await this.cancelAllResting("kill_switch");
         this.d.reporter.report("event", null, null, { event: "kill_switch_on" });
@@ -114,6 +150,7 @@ export class Engine {
         if (!this.haltedRemote) {
           this.haltedRemote = true;
           this.dropReentries("token_rejected");
+          this.dropTakerWatches("token_rejected");
           log("CLIENT TOKEN REJECTED - stopping: cancelling resting orders and making no decisions until it works again", { status: e.status });
           await this.cancelAllResting("token_rejected");
           this.d.reporter.report("event", null, null, { event: "token_rejected" });
@@ -138,6 +175,7 @@ export class Engine {
     const nowSec = localSec + this.clockOffsetSec;
     // A watched window whose 15 minutes are over (e.g. its card was never seen again) is forgotten.
     for (const k of this.reentry.keys()) if (nowSec - Number(k.split(":")[1]) > 900) this.reentry.delete(k);
+    for (const k of this.building.keys()) if (nowSec - Number(k.split(":")[1]) > 900) this.building.delete(k);
 
     // A claim that never became an order (crash mid-placement) is failed, not retried.
     if (this.live) {
@@ -170,6 +208,12 @@ export class Engine {
     // live price, which is a ticks MIDPOINT a few seconds old. Maker mode keeps the card-price gate.
     const gateOnCardPrice = cfg.execution !== "taker";
     const key = `${card.symbol}:${card.windowStartTs}`;
+    // A taker window short of its stake: look at it again (it was decided already; see placeTaker).
+    const building = this.building.get(key);
+    if (building) {
+      if (this.live) await this.continueTaker(card, nowSec, building);
+      return;
+    }
     const waiting = this.reentry.get(key);
     // A window being watched for re-entry may be decided up to reentryUntilSeconds after open (not the normal cutoff).
     const rules = waiting ? { ...cfg.rules, maxAgeSeconds: Math.max(cfg.rules.maxAgeSeconds, cfg.reentryUntilSeconds) } : cfg.rules;
@@ -341,7 +385,7 @@ export class Engine {
     if (!claimed) return;
 
     if (cfg.execution === "taker") {
-      await this.placeTaker(card, shares, tokenId, meta, base.decidedAtMs);
+      await this.placeTaker(card, tokenId, meta, base.decidedAtMs);
       return;
     }
 
@@ -365,106 +409,261 @@ export class Engine {
     }
   }
 
+  // ---- taker execution ------------------------------------------------------------------------------
+
   /**
-   * Taker execution. Each attempt reads a FRESH order book, then sends ONE fill-and-kill buy capped at
-   * min(best ask + TAKER_SLIPPAGE_CENTS, ENTRY_MAX_CENTS). Whatever matches is the trade; the exchange
-   * cancels the rest, so nothing ever rests.
+   * Taker execution. Each attempt reads a FRESH order book, then sends ONE fill-and-kill buy for what is left of the
+   * stake, capped at min(best ask + TAKER_SLIPPAGE_CENTS, ENTRY_MAX_CENTS). Whatever matches is bought; the exchange
+   * cancels the rest, so nothing ever rests. The stake is the most the window ever buys: still one position per window.
    *
-   * Retries: a fill-and-kill that fills NOTHING cannot double-fill, so it is retried - at most
-   * TAKER_MAX_ATTEMPTS times, only within TAKER_RETRY_WINDOW_SECONDS of the decision, and only while the
-   * ask stays inside the entry range. It NEVER retries after any fill (partial or full), after an
-   * unexpected error (an order may have landed), if the public feed already shows a purchase of this
-   * token, or if that feed cannot be read. The window was claimed BEFORE this call, so a restart can
-   * never send it again either.
+   * The first burst: at most TAKER_MAX_ATTEMPTS sends, only within TAKER_RETRY_WINDOW_SECONDS of the decision, and only
+   * while the ask stays inside the entry range. A no-match is retried (a fill-and-kill that matched nothing cannot
+   * double-fill); a partial fill is followed by a send for the remainder.
+   *
+   * If the burst ends short of the stake (nothing matched, the ask left the range, or only part filled), the window is
+   * WATCHED on every tick until AUTOTRADE_REENTRY_UNTIL_SECONDS after open, and the rest is bought the first time the ask
+   * is back in range: at most one send every TAKER_WATCH_GAP_MS, TAKER_MAX_SENDS_PER_WINDOW in all. The watch is in
+   * memory only, so a restart forgets it and never sends the window again.
+   *
+   * Before every send after the first, the public feed must show no purchase of this token beyond what this engine
+   * bought itself (e.g. one made by hand in the app); if it does, the window is left alone for good. So is a window
+   * whose send failed with an unexpected error (the order may or may not have landed).
    */
-  private async placeTaker(card: Card, expectedShares: number, tokenId: string, meta: { tickSize: number; minOrderSize: number }, decidedAtMs: number): Promise<void> {
-    const { cfg, store, trader, market } = this.d;
+  private async placeTaker(card: Card, tokenId: string, meta: Meta, decidedAtMs: number): Promise<void> {
+    const { cfg } = this.d;
     const sleep = this.d.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-    const base = { symbol: card.symbol, window: card.windowStartTs, execution: "taker" as const };
+    const p: TakerProgress = { tokenId, meta, decidedAtMs, spentUsd: 0, feeUsd: 0, shares: 0, sends: 0, lastSendMs: 0, lastCap: cfg.range.maxCents / 100 };
     const max = cfg.takerMaxAttempts;
-    let last: Record<string, unknown> = {};
+    const retryOver = () => this.d.nowMs() - decidedAtMs > cfg.takerRetryWindowSeconds * 1000;
     let detail = "nothing matched";
-    let attempts = 0;
+    let why: string | undefined;
+    let last: Record<string, unknown> = {};
+    let end: "complete" | "no_fill" | "price_moved" | "stop" = "no_fill";
 
     for (let attempt = 1; attempt <= max; attempt++) {
       if (attempt > 1) {
-        // A retry is only ever safe after a clean no-fill. Check the clock, then the public feed.
-        if (this.d.nowMs() - decidedAtMs > cfg.takerRetryWindowSeconds * 1000) return this.takerNotFilled(card, "taker_no_fill", `retry window (${cfg.takerRetryWindowSeconds}s) is over: ${detail}`, attempts, last);
+        // A further send is only ever safe after a clean result. Check the clock, then the public feed.
+        if (retryOver()) { detail = `retry window (${cfg.takerRetryWindowSeconds}s) is over: ${detail}`; break; }
         await sleep(TAKER_RETRY_DELAY_MS);
-        if (this.d.nowMs() - decidedAtMs > cfg.takerRetryWindowSeconds * 1000) return this.takerNotFilled(card, "taker_no_fill", `retry window (${cfg.takerRetryWindowSeconds}s) is over: ${detail}`, attempts, last);
-        try {
-          if (boughtSince(await market.activity(trader!.wallet), tokenId, Math.floor(decidedAtMs / 1000))) {
-            return this.takerNotFilled(card, "taker_no_fill", "not retrying: the public feed already shows a purchase of this token", attempts, last);
-          }
-        } catch (e) {
-          return this.takerNotFilled(card, "taker_no_fill", `not retrying: cannot confirm nothing was bought (${e instanceof Error ? e.message : String(e)})`, attempts, last);
-        }
+        if (retryOver()) { detail = `retry window (${cfg.takerRetryWindowSeconds}s) is over: ${detail}`; break; }
+        const check = await this.purchaseCheck(p);
+        if (check.state === "unknown_purchase") { detail = "not retrying: the public feed already shows a purchase of this token"; end = "stop"; break; }
+        if (check.state === "unreadable") { detail = `not retrying: cannot confirm nothing was bought (${check.error})`; break; }
       }
 
-      // 1. a FRESH book, immediately before sending
-      let asks: BookLevel[];
-      const bookAt = this.d.nowMs();
-      try {
-        asks = await market.asks(tokenId);
-      } catch (e) {
-        detail = `order book unavailable (${e instanceof Error ? e.message : String(e)})`;
-        this.d.log("TAKER ATTEMPT SKIPPED", { ...base, attempt, of: max, reason: "book_unavailable", detail }); // nothing was sent
+      const r = await this.takerAttempt(card, p, attempt, max, false);
+      if (r.snap) last = r.snap;
+      if (r.kind === "error") return; // recorded by takerAttempt: never retried, never watched
+      if (r.kind === "filled") {
+        if (this.remainderDone(p)) { end = "complete"; break; }
+        detail = "partly filled";
         continue;
       }
-      const plan = planTakerAttempt({ asks, tickSize: meta.tickSize, minOrderSize: meta.minOrderSize, stakeUsd: cfg.stakeUsd, slippageCents: cfg.takerSlippageCents, range: cfg.range });
-
-      // 2. the ask must still be inside the entry range - never chased
-      if (!plan.ok) {
-        const snap = { bestAsk: plan.bestAsk, askSize: plan.askSize, cap: plan.cap, maxCents: cfg.range.maxCents };
-        this.d.log("TAKER ATTEMPT SKIPPED", { ...base, attempt, of: max, reason: plan.reason, ...snap });
-        return this.takerNotFilled(card, plan.reason === "ask_out_of_range" ? "taker_price_moved" : "taker_no_fill", `the fresh book no longer allows a buy (${plan.reason})`, attempts, snap);
-      }
-
-      // 3. send, logging exactly what the order was based on
-      const snap = { bestAsk: plan.book.bestAsk, askSize: plan.book.askSize, sizeWithinCap: plan.book.sizeWithinCap, cap: plan.book.cap };
-      last = snap;
-      attempts = attempt;
-      this.d.log("TAKER ATTEMPT", { ...base, attempt, of: max, ...snap, slippageCents: cfg.takerSlippageCents, maxCents: cfg.range.maxCents, bookAgeMs: this.d.nowMs() - bookAt, requestedShares: expectedShares });
-      this.d.reporter.report("order", card.symbol, card.windowStartTs, { event: "taker_attempt", execution: "taker", attempt, of: max, ...snap });
-      try {
-        const res = await trader!.marketBuy({ tokenId, amountUsd: cfg.stakeUsd, maxPrice: plan.book.cap, builderCode: this.builderCode! });
-        this.balance = undefined;
-        if (res.shares > 0) return await this.takerFilled(card, tokenId, res, plan.book.cap, attempt, expectedShares, snap); // any fill: done, NEVER retried
-        detail = "the order was accepted but nothing matched";
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        if (!NO_MATCH.test(msg)) {
-          // Not the exchange's clean "nothing to match": the order may or may not have landed. Never retry.
-          await store.updateWindow(card.symbol, card.windowStartTs, { decision: "live_failed", reason: `place_failed: ${msg}`.slice(0, 300) });
-          this.d.log("TAKER ORDER FAILED (window not retried)", { ...base, attempt, ...snap, error: msg });
-          this.d.reporter.report("event", card.symbol, card.windowStartTs, { event: "place_failed", execution: "taker", attempt, error: msg.slice(0, 300) });
-          return;
-        }
-        detail = msg.slice(0, 200);
-      }
-      this.d.log("TAKER ATTEMPT NOT FILLED", { ...base, attempt, of: max, ...snap, detail });
+      if (r.kind === "no_match") { detail = r.detail; why = r.why; continue; }
+      if (r.kind === "book_unavailable") { detail = r.detail; continue; }
+      if (r.kind === "below_min_order_size" && p.shares > 0) { end = "complete"; break; }
+      end = r.kind === "ask_out_of_range" ? "price_moved" : "no_fill";
+      detail = `the fresh book no longer allows a buy (${r.kind})`;
+      break;
     }
-    return this.takerNotFilled(card, "taker_no_fill", detail, attempts, last);
+
+    if (end === "complete") return;
+    if (p.shares === 0) await this.takerNotFilled(card, end === "price_moved" ? "taker_price_moved" : "taker_no_fill", detail, p.sends, last, why);
+    if (end !== "stop") this.startTakerWatch(card, p, p.shares > 0 ? "remainder" : "no_fill");
   }
 
-  private async takerFilled(card: Card, tokenId: string, res: { orderId: string; spentUsd: number; shares: number; txHashes: string[] }, cap: number, attempt: number, expectedShares: number, snap: Record<string, unknown>): Promise<void> {
+  /**
+   * One send from a fresh book (or none, if the book no longer allows a buy). `quiet` drops the "skipped" log line:
+   * a watched window looks at the book on every tick, and an ask outside the range is expected there, not news.
+   */
+  private async takerAttempt(card: Card, p: TakerProgress, attempt: number, of: number, quiet: boolean): Promise<AttemptResult> {
+    const { cfg, store, market, trader } = this.d;
+    const base = { symbol: card.symbol, window: card.windowStartTs, execution: "taker" as const };
+
+    // 1. a FRESH book, immediately before sending
+    const bookAt = this.d.nowMs();
+    let asks: BookLevel[];
+    try {
+      asks = await market.asks(p.tokenId);
+    } catch (e) {
+      const detail = `order book unavailable (${e instanceof Error ? e.message : String(e)})`;
+      if (!quiet) this.d.log("TAKER ATTEMPT SKIPPED", { ...base, attempt, of, reason: "book_unavailable", detail }); // nothing was sent
+      return { kind: "book_unavailable", detail };
+    }
+    const remainingUsd = this.remainingUsd(p);
+    const plan = planTakerAttempt({ asks, tickSize: p.meta.tickSize, minOrderSize: p.meta.minOrderSize, stakeUsd: remainingUsd, slippageCents: cfg.takerSlippageCents, range: cfg.range });
+
+    // 2. the ask must still be inside the entry range - never chased
+    if (!plan.ok) {
+      const snap = { bestAsk: plan.bestAsk, askSize: plan.askSize, cap: plan.cap, maxCents: cfg.range.maxCents };
+      if (!quiet) this.d.log("TAKER ATTEMPT SKIPPED", { ...base, attempt, of, reason: plan.reason, ...snap });
+      return { kind: plan.reason, snap };
+    }
+
+    // 3. send, logging exactly what the order was based on
+    const snap = { bestAsk: plan.book.bestAsk, askSize: plan.book.askSize, sizeWithinCap: plan.book.sizeWithinCap, cap: plan.book.cap };
+    const topUp = p.shares > 0;
+    p.sends += 1;
+    p.lastSendMs = this.d.nowMs();
+    this.d.log("TAKER ATTEMPT", { ...base, attempt, of, ...snap, slippageCents: cfg.takerSlippageCents, maxCents: cfg.range.maxCents, bookAgeMs: this.d.nowMs() - bookAt, requestedUsd: remainingUsd, requestedShares: plan.shares, ...(topUp ? { topUp } : {}) });
+    this.d.reporter.report("order", card.symbol, card.windowStartTs, { event: "taker_attempt", execution: "taker", attempt, of, ...snap, ...(topUp ? { topUp, requestedUsd: remainingUsd } : {}) });
+    let exchange: string;
+    try {
+      const res = await trader!.marketBuy({ tokenId: p.tokenId, amountUsd: remainingUsd, maxPrice: plan.book.cap, builderCode: this.builderCode! });
+      this.balance = undefined;
+      if (res.shares > 0) {
+        await this.recordTakerFill(card, p, res, plan.book.cap, attempt, snap);
+        return { kind: "filled", snap };
+      }
+      exchange = "the order was accepted but nothing matched";
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!NO_MATCH.test(msg)) {
+        // Not the exchange's clean "nothing to match": the order may or may not have landed. Never sent again.
+        if (p.shares === 0) await store.updateWindow(card.symbol, card.windowStartTs, { decision: "live_failed", reason: `place_failed: ${msg}`.slice(0, 300) });
+        this.d.log("TAKER ORDER FAILED (window not retried)", { ...base, attempt, ...snap, error: msg });
+        this.d.reporter.report("event", card.symbol, card.windowStartTs, { event: "place_failed", execution: "taker", attempt, error: msg.slice(0, 300) });
+        return { kind: "error", snap };
+      }
+      exchange = msg.slice(0, 200);
+    }
+    const why = await this.explainNoMatch(card, p, attempt, of, asks, snap, exchange);
+    return { kind: "no_match", snap, detail: exchange, why };
+  }
+
+  /**
+   * An attempt matched nothing: read the book once more and say why, next to the book the order was sent from.
+   *   ask_moved_above_cap        - the best ask was above the cap by the time we looked again (the market ran);
+   *   nothing_matched_within_cap - an ask at or below the cap is still there (the liquidity we saw was taken or
+   *                                pulled as the order landed, or the exchange refused the match);
+   *   book_empty_after / book_unreadable_after - no asks at all / the book couldn't be read.
+   */
+  private async explainNoMatch(card: Card, p: TakerProgress, attempt: number, of: number, sentFrom: BookLevel[], snap: { bestAsk: number; askSize?: number; sizeWithinCap?: number; cap: number }, exchange: string): Promise<string> {
+    let after: BookLevel[] | undefined;
+    try {
+      after = await this.d.market.asks(p.tokenId);
+    } catch {
+      after = undefined;
+    }
+    const askAfter = after ? bestAskOf(after) : undefined;
+    const why = !after ? "book_unreadable_after" : askAfter === undefined ? "book_empty_after" : askAfter > snap.cap + 1e-9 ? "ask_moved_above_cap" : "nothing_matched_within_cap";
+    const info = {
+      attempt, of, ...snap, depth: topOfBook(sentFrom),
+      askAfter: askAfter ?? null, sizeWithinCapAfter: after ? sizeAtOrBelow(after, snap.cap) ?? null : null, depthAfter: after ? topOfBook(after) : null,
+      exchange, why,
+    };
+    this.d.log("TAKER ATTEMPT NOT FILLED", { symbol: card.symbol, window: card.windowStartTs, execution: "taker", ...info, detail: exchange });
+    this.d.reporter.report("event", card.symbol, card.windowStartTs, { event: "taker_attempt_no_match", execution: "taker", ...info });
+    return why;
+  }
+
+  /** A fill (full or partial) of one send: stored as a finished taker leg, and the window's totals updated. */
+  private async recordTakerFill(card: Card, p: TakerProgress, res: MarketBuyResult, cap: number, attempt: number, snap: Record<string, unknown>): Promise<void> {
     const { cfg, store } = this.d;
-    const fillPrice = Math.round((res.spentUsd / res.shares) * 1e6) / 1e6;
+    const first = p.shares === 0;
+    const fillPrice = r6(res.spentUsd / res.shares);
     const feeUsd = feeFor("taker", res.shares, fillPrice);
+    p.spentUsd = r6(p.spentUsd + res.spentUsd);
+    p.feeUsd = r6(p.feeUsd + feeUsd);
+    p.shares = r6(p.shares + res.shares);
+    p.lastCap = cap;
+    const avgPrice = r6(p.spentUsd / p.shares);
+    const allInUsd = r6(res.spentUsd + feeUsd);
     await store.addLeg({
-      symbol: card.symbol, windowStartTs: card.windowStartTs, kind: "taker", orderId: res.orderId, tokenId, price: fillPrice, shares: res.shares,
+      symbol: card.symbol, windowStartTs: card.windowStartTs, kind: "taker", orderId: res.orderId, tokenId: p.tokenId, price: fillPrice, shares: res.shares,
       placedAtMs: this.d.nowMs(), expiresAtSec: card.windowEndTs, status: "filled", filledShares: res.shares,
     });
-    await store.updateWindow(card.symbol, card.windowStartTs, { decision: "live_placed", execution: "taker", limitPrice: cap, shares: res.shares, fillPrice, feeUsd });
-    this.d.log("TAKER ORDER FILLED", { symbol: card.symbol, window: card.windowStartTs, execution: "taker", attempt, orderId: res.orderId, fillPrice, shares: res.shares, requestedShares: expectedShares, spentUsd: res.spentUsd, feeUsd, allInUsd: Math.round((res.spentUsd + feeUsd) * 1e6) / 1e6, feeSource: "polymarket_formula_estimate", ...snap, txHashes: res.txHashes });
-    this.d.reporter.report("decision", card.symbol, card.windowStartTs, { mode: "live", execution: "taker", decision: "live_placed", lean: card.lean, entry: card.entry, currentPrice: card.currentPrice, limitPrice: cap, shares: res.shares, stakeUsd: cfg.stakeUsd, fillPrice, feeUsd });
-    this.d.reporter.report("order", card.symbol, card.windowStartTs, { event: "filled", execution: "taker", kind: "taker", attempt, orderId: res.orderId, price: fillPrice, shares: res.shares, filled: res.shares, spentUsd: res.spentUsd, feeUsd, allInUsd: Math.round((res.spentUsd + feeUsd) * 1e6) / 1e6, feeSource: "polymarket_formula_estimate", ...snap });
+    // The window holds the totals: shares bought, the average price paid, the fees - what P&L is computed from.
+    await store.updateWindow(card.symbol, card.windowStartTs, { decision: "live_placed", reason: null, execution: "taker", limitPrice: cap, shares: p.shares, fillPrice: avgPrice, feeUsd: p.feeUsd });
+    const totals = { topUp: !first, totalShares: p.shares, totalSpentUsd: p.spentUsd, avgPrice, remainingUsd: this.remainingUsd(p) };
+    this.d.log("TAKER ORDER FILLED", { symbol: card.symbol, window: card.windowStartTs, execution: "taker", attempt, orderId: res.orderId, fillPrice, shares: res.shares, spentUsd: res.spentUsd, feeUsd, allInUsd, feeSource: "polymarket_formula_estimate", ...snap, txHashes: res.txHashes, ...totals });
+    if (first) {
+      this.d.reporter.report("decision", card.symbol, card.windowStartTs, { mode: "live", execution: "taker", decision: "live_placed", lean: card.lean, entry: card.entry, currentPrice: card.currentPrice, limitPrice: cap, shares: res.shares, stakeUsd: cfg.stakeUsd, fillPrice, feeUsd });
+    }
+    this.d.reporter.report("order", card.symbol, card.windowStartTs, { event: "filled", execution: "taker", kind: "taker", attempt, orderId: res.orderId, price: fillPrice, shares: res.shares, filled: res.shares, spentUsd: res.spentUsd, feeUsd, allInUsd, feeSource: "polymarket_formula_estimate", ...snap, ...totals });
   }
 
-  private async takerNotFilled(card: Card, reason: string, detail: string, attempts: number, snap: Record<string, unknown>): Promise<void> {
+  /** Nothing bought yet and the window is given up (for now): recorded live_failed with the reason. */
+  private async takerNotFilled(card: Card, reason: string, detail: string, attempts: number, snap: Record<string, unknown>, why?: string): Promise<void> {
     await this.d.store.updateWindow(card.symbol, card.windowStartTs, { decision: "live_failed", reason, execution: "taker" });
-    this.d.log("TAKER ORDER NOT FILLED (window not retried)", { symbol: card.symbol, window: card.windowStartTs, execution: "taker", reason, attempts, of: this.d.cfg.takerMaxAttempts, detail, ...snap });
-    this.d.reporter.report("event", card.symbol, card.windowStartTs, { event: "taker_no_fill", execution: "taker", reason, attempts, detail, ...snap });
+    this.d.log("TAKER ORDER NOT FILLED", { symbol: card.symbol, window: card.windowStartTs, execution: "taker", reason, attempts, of: this.d.cfg.takerMaxAttempts, detail, ...(why ? { why } : {}), ...snap });
+    this.d.reporter.report("event", card.symbol, card.windowStartTs, { event: "taker_no_fill", execution: "taker", reason, attempts, detail, ...(why ? { why } : {}), ...snap });
+  }
+
+  /** What is left of the stake to spend (fees included), in whole cents. */
+  private remainingUsd(p: TakerProgress): number {
+    return Math.max(0, Math.floor((this.d.cfg.stakeUsd - p.spentUsd - p.feeUsd) * 100 + 1e-9) / 100);
+  }
+
+  /** The stake is used up: what's left couldn't buy the market's minimum order at the last cap. */
+  private remainderDone(p: TakerProgress): boolean {
+    return Math.floor((this.remainingUsd(p) / p.lastCap) * 100 + 1e-9) / 100 < p.meta.minOrderSize;
+  }
+
+  /** Does the public feed show a purchase of this token (since the decision) beyond what this engine bought itself? */
+  private async purchaseCheck(p: TakerProgress): Promise<{ state: "ok" | "unknown_purchase" } | { state: "unreadable"; error: string }> {
+    try {
+      const activity = await this.d.market.activity(this.d.trader!.wallet);
+      return { state: unknownPurchaseShares(activity, p.tokenId, Math.floor(p.decidedAtMs / 1000), p.shares) > 0 ? "unknown_purchase" : "ok" };
+    } catch (e) {
+      return { state: "unreadable", error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  private serverNowSec(): number {
+    return Math.floor(this.d.nowMs() / 1000) + this.clockOffsetSec;
+  }
+
+  private startTakerWatch(card: Card, p: TakerProgress, reason: "no_fill" | "remainder"): void {
+    const { cfg } = this.d;
+    if (!this.live || cfg.reentryUntilSeconds <= 0) return;
+    if (this.serverNowSec() - card.windowStartTs >= cfg.reentryUntilSeconds || p.sends >= TAKER_MAX_SENDS_PER_WINDOW) return;
+    this.building.set(`${card.symbol}:${card.windowStartTs}`, p);
+    const info = { reason, untilSec: cfg.reentryUntilSeconds, remainingUsd: this.remainingUsd(p), totalShares: p.shares, sends: p.sends };
+    this.d.log("TAKER WATCH: buying the rest the first time the ask is back in range", { symbol: card.symbol, window: card.windowStartTs, ...info });
+    this.d.reporter.report("event", card.symbol, card.windowStartTs, { event: "taker_watch", execution: "taker", ...info });
+  }
+
+  /** One look at a watched window (every tick). Sends at most once, and only when every check passes. */
+  private async continueTaker(card: Card, nowSec: number, p: TakerProgress): Promise<void> {
+    const { cfg, store, trader } = this.d;
+    const key = `${card.symbol}:${card.windowStartTs}`;
+    const end = (reason: string) => {
+      this.building.delete(key);
+      const info = { reason, sends: p.sends, totalShares: p.shares, remainingUsd: this.remainingUsd(p) };
+      this.d.log("TAKER WATCH OVER", { symbol: card.symbol, window: card.windowStartTs, ...info });
+      this.d.reporter.report("event", card.symbol, card.windowStartTs, { event: "taker_watch_end", execution: "taker", ...info });
+    };
+    if (!card.hasPrediction || !card.take || !card.lean) return end("signal_revoked");
+    if (nowSec - card.windowStartTs >= cfg.reentryUntilSeconds) return end("deadline");
+    if (p.sends >= TAKER_MAX_SENDS_PER_WINDOW) return end("max_sends");
+    if (this.d.nowMs() - p.lastSendMs < TAKER_WATCH_GAP_MS) return;
+    if ((await store.dayStats(card.windowStartTs)).realizedPnlUsd <= -cfg.rules.dailyLossLimitUsd) return end("daily_loss_limit");
+    if (!trader || !this.builderCode) return;
+
+    const check = await this.purchaseCheck(p);
+    if (check.state === "unknown_purchase") return end("unexpected_purchase");
+    if (check.state !== "ok") return; // can't confirm: look again next tick, send nothing now
+    let balance: number;
+    try {
+      balance = await this.liveBalance();
+    } catch {
+      return;
+    }
+    if (balance < this.remainingUsd(p)) return;
+
+    const r = await this.takerAttempt(card, p, p.sends + 1, TAKER_MAX_SENDS_PER_WINDOW, true);
+    if (r.kind === "error") return end("error");
+    if (r.kind === "filled" && this.remainderDone(p)) return end("complete");
+    if (r.kind === "below_min_order_size" && p.shares > 0) return end("complete");
+    // No match, ask out of range, no asks, book unreadable: keep watching.
+  }
+
+  /** Drops every taker watch (kill switch, revoked token). */
+  private dropTakerWatches(why: string): void {
+    if (this.building.size === 0) return;
+    this.d.log("taker watches dropped", { why, windows: [...this.building.keys()] });
+    this.building.clear();
   }
 
   // ---- managing open orders ---------------------------------------------------------------------

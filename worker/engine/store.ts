@@ -182,7 +182,7 @@ export class PgStore implements Store {
     await this.sql`
       update engine_windows set
         decision    = coalesce(${p.decision ?? null}, decision),
-        reason      = coalesce(${p.reason ?? null}, reason),
+        reason      = case when ${p.reason === null}::boolean then null else coalesce(${p.reason ?? null}, reason) end, -- null clears it (a watched window that filled)
         limit_price = coalesce(${p.limitPrice ?? null}, limit_price),
         shares      = coalesce(${p.shares ?? null}, shares),
         execution   = coalesce(${p.execution ?? null}, execution),

@@ -192,9 +192,9 @@ Set these in Railway → your worker service → Variables.
 | `ENTRY_MAX_CENTS` | no | `60` | Highest live price it will buy at. Above this there is no trade. |
 | `AUTOTRADE_EXECUTION` | no | `maker_first` | How orders are sent. `maker_first` rests a maker order, then "fills now" after `MAKER_FILL_TIMEOUT_SECONDS`. `taker` sends one immediate fill-and-kill order at the best ask and nothing ever rests. See section 5a. |
 | `TAKER_SLIPPAGE_CENTS` | no | `1` | `taker` only: the price cap of each fill-and-kill order is `min(best ask + this, ENTRY_MAX_CENTS)`. It absorbs a one-cent move between reading the book and the order landing; it can never go above `ENTRY_MAX_CENTS`. |
-| `TAKER_MAX_ATTEMPTS` | no | `3` | `taker` only: how many fill-and-kill attempts per window. Only a clean no-fill is retried. |
+| `TAKER_MAX_ATTEMPTS` | no | `3` | `taker` only: how many fill-and-kill attempts in the first burst for a window. A clean no-fill is retried; a partial fill is followed by an order for the rest of the stake. |
 | `TAKER_RETRY_WINDOW_SECONDS` | no | `20` | `taker` only: retries stop this many seconds after the decision. |
-| `AUTOTRADE_REENTRY_UNTIL_SECONDS` | no | `480` | `taker` only: if the ask is above `ENTRY_MAX_CENTS` when a TAKE is decided, keep watching until this many seconds after the window opened and buy the first time the ask is back in range (section 5b). `0` turns it off. At most `840`. |
+| `AUTOTRADE_REENTRY_UNTIL_SECONDS` | no | `480` | `taker` only: if the ask is above `ENTRY_MAX_CENTS` when a TAKE is decided, keep watching until this many seconds after the window opened and buy the first time the ask is back in range (section 5b). From v1.0.2 it is also how long a window that missed or only partly filled keeps being watched (section 5c). `0` turns both off. At most `840`. |
 | `MAKER_FILL_TIMEOUT_SECONDS` | no | `45` | `maker_first` only: how long a maker order rests before "fill now" converts the remainder. |
 | `ORDER_TTL_SECONDS` | no | `360` | How long an order may rest at most (it never outlives its 15-minute window). |
 | `AUTOTRADE_WAIT_SECONDS` | no | `10` | Wait after window open before deciding. |
@@ -214,7 +214,7 @@ same price range, the same stake, balance and daily limits. Only the order diffe
 |---|---|---|
 | What is sent | A resting **maker** order just below the best ask. After `MAKER_FILL_TIMEOUT_SECONDS` (45s), if it has not filled and the price is still in range, it is cancelled and the rest is bought as a **taker** order. | **One** immediate **fill-and-kill** order at the best ask. Whatever matches at once is the trade; the exchange cancels the rest. **Nothing ever rests.** |
 | Price rule | Only buys while the price is inside `ENTRY_MIN_CENTS`-`ENTRY_MAX_CENTS`, judged from the signal card's live price. | The real best ask from the live order book must be inside that range (the card's midpoint is not used). Each order's cap is `min(best ask + TAKER_SLIPPAGE_CENTS, ENTRY_MAX_CENTS)`. `ENTRY_MAX_CENTS` (60c by default) is a hard ceiling: an ask above it is skipped (`skipped: price_out_of_band_at_sizing`), never chased. |
-| Fill rate | Can miss (see below). | Fills whenever the ask is still there when the order lands. A fill-and-kill that fills **nothing** cannot double-fill, so it is retried, up to `TAKER_MAX_ATTEMPTS` (3) times within `TAKER_RETRY_WINDOW_SECONDS` (20s) of the decision, reading a **fresh book** before each attempt and only while the ask stays in range. It is **never** retried after any fill (partial or full), after an unexpected error, or if it cannot confirm nothing was bought. If every attempt misses, the window is recorded `taker_no_fill` and is not tried again. |
+| Fill rate | Can miss (see below). | Fills whenever the ask is still there when the order lands. A fill-and-kill that fills **nothing** cannot double-fill, so it is retried, up to `TAKER_MAX_ATTEMPTS` (3) times within `TAKER_RETRY_WINDOW_SECONDS` (20s) of the decision, reading a **fresh book** before each attempt and only while the ask stays in range. A **partial** fill is followed by an order for the rest of the stake. It never sends again after an unexpected error, or if the public feed shows a purchase it did not make itself. If the burst ends short of the stake, the window is **watched** until `AUTOTRADE_REENTRY_UNTIL_SECONDS` (section 5c). |
 | Fees | Makers pay no Polymarket fee. | Takers pay Polymarket's taker fee (below). |
 | Entry price | About one tick (1c) better than the ask. | The ask itself. |
 
@@ -281,6 +281,31 @@ Everything else still applies while it watches: one trade per window, the daily 
 every look), the kill switch and a rejected token (both end the watch), and a revoked signal (the watch ends with
 `RE-ENTRY STOPPED`). An ask *below* the range at decision time is not watched. A restart during a watch does not
 resume it. Set `AUTOTRADE_REENTRY_UNTIL_SECONDS=0` to turn re-entry off.
+
+### 5c. Keep watching after a miss, and buy the rest of a partial fill (v1.0.2+, taker mode)
+
+The first burst of orders for a window can end short of the stake: every attempt matched nothing, the ask ran above the
+range just before the order was sent (`taker_price_moved`), or only part of the stake filled (the book had just a few
+shares at the ask). From v1.0.2 the worker does not give up on that window:
+
+- it logs `TAKER WATCH: buying the rest the first time the ask is back in range`;
+- on every tick it reads a fresh book, and the first time the ask is inside the range it sends one fill-and-kill order
+  for **what is left of the stake** (the same cap: best ask + `TAKER_SLIPPAGE_CENTS`, never above `ENTRY_MAX_CENTS`);
+- at most one order every 5 seconds and 12 in all per window; the watch ends at `AUTOTRADE_REENTRY_UNTIL_SECONDS`
+  after the window opened (480 = minute 8), when the stake is used up, or on any of the stops below, and logs
+  `TAKER WATCH OVER` with the reason (`complete`, `deadline`, `max_sends`, `signal_revoked`,
+  `unexpected_purchase`, `daily_loss_limit`, `error`).
+
+Still one position per window: the stake is the most a window ever buys. Before every order it checks the public
+trade feed, and if the wallet bought this side of the window in a way the worker did not (for example by hand in the
+app) it stops for good. If the feed can't be read, or the balance is below what's left, it sends nothing on that look.
+The kill switch and a rejected token end every watch, and a restart does not resume one. The daily loss limit is
+re-checked on every look. `AUTOTRADE_REENTRY_UNTIL_SECONDS=0` turns watching off (a miss is then final, as before).
+
+When an attempt matches nothing, the worker reads the book again and logs `TAKER ATTEMPT NOT FILLED` with why:
+`ask_moved_above_cap` (the market ran past the cap), `nothing_matched_within_cap` (the ask we saw was taken or
+pulled as the order landed), or `book_empty_after` / `book_unreadable_after`, next to the book it sent from
+(`bestAsk`, `cap`, `sizeWithinCap`, `depth`) and the book right after (`askAfter`, `depthAfter`).
 
 ---
 
@@ -352,7 +377,7 @@ If the worker's location ever becomes blocked by Polymarket it halts by itself (
 | `skipped: already_traded_window` | The wallet already traded that window (for example by hand in the app). The worker never doubles up. |
 | `skipped: price_out_of_band` | The live price was outside your allowed range when it decided. Normal. |
 | `skipped: price_out_of_band_at_sizing` | The order-book price (in taker mode the best ask) was outside your allowed range when it sized the order. Normal. |
-| `TAKER ORDER NOT FILLED (window not retried)` | Taker mode only: every attempt (up to `TAKER_MAX_ATTEMPTS`) found nothing to match at or below its cap, or the ask left the entry range (`reason: taker_price_moved`), so nothing was bought. Compare `bestAsk`, `askSize` and `cap` in the `TAKER ATTEMPT` lines: a fast market moving more than `TAKER_SLIPPAGE_CENTS` per second is the usual cause. That window is not tried again; nothing is left resting. |
+| `TAKER ORDER NOT FILLED` | Taker mode only: the first burst (up to `TAKER_MAX_ATTEMPTS`) found nothing to match at or below its cap, or the ask left the entry range (`reason: taker_price_moved`), so nothing was bought yet. The `why` field and the `TAKER ATTEMPT NOT FILLED` lines say what happened (section 5c); a fast market moving more than `TAKER_SLIPPAGE_CENTS` per second is the usual cause. From v1.0.2 the window is then watched (`TAKER WATCH`) until `AUTOTRADE_REENTRY_UNTIL_SECONDS`. Nothing is left resting. |
 | `ORDER FAILED (window not retried)` | Polymarket rejected the order; the reason is in the log line. That window is not retried. |
 | `CLIENT TOKEN REJECTED - stopping` | Your token was revoked mid-run. The worker cancelled its resting orders and paused; it resumes automatically if the token works again. |
 

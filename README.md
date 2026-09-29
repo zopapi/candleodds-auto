@@ -1,4 +1,4 @@
-# CandleOdds Auto worker (v1.0.1)
+# CandleOdds Auto worker (v1.0.2)
 
 The self-hosted bot behind CandleOdds **Auto**: it trades the CandleOdds BTC/ETH 15-minute TAKE signals on Polymarket for
 one member's wallet, from **the member's own Railway account, with the member's own key**. CandleOdds never receives the key.

@@ -4,6 +4,7 @@
 import { killSwitchOn } from "../decision.ts";
 import { loadEngineConfig } from "./config.ts";
 import { Engine } from "./engine.ts";
+import { WORKER_VERSION } from "./version.ts";
 import { HttpMarketData } from "./market.ts";
 import { evaluateGeoblock, fetchGeoblock, livePreflight, WRONG_REGION_HINT } from "./preflight.ts";
 import { HttpReporter } from "./report.ts";
@@ -38,6 +39,7 @@ export async function run(mode: "shadow" | "live"): Promise<void> {
       ? "CandleOdds worker starting in LIVE mode - it WILL place real orders"
       : "CandleOdds worker starting in SHADOW mode - it records what it would do and places nothing",
     {
+      version: WORKER_VERSION,
       execution: cfg.execution,
       stakeUsd: cfg.stakeUsd,
       maxTradesPerDay: cfg.rules.maxTradesPerDay,
@@ -94,7 +96,7 @@ export async function run(mode: "shadow" | "live"): Promise<void> {
     locationBlocked = pre.locationBlocked;
   }
 
-  const reporter = new HttpReporter(cfg.candleoddsUrl, cfg.token, { mode, wallet: trader?.wallet ?? null, engine: "v1", execution: cfg.execution });
+  const reporter = new HttpReporter(cfg.candleoddsUrl, cfg.token, { mode, wallet: trader?.wallet ?? null, engine: "v1", version: WORKER_VERSION, execution: cfg.execution });
   reporter.report("event", null, null, {
     event: "started",
     execution: cfg.execution,
